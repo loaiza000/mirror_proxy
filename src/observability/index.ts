@@ -1,9 +1,8 @@
 export { logger, type Logger } from './logger';
 export { metrics, register } from './metrics';
-export { 
-  createRootSpan, 
-  createShadowSpan, 
-  finishSpan, 
+export {
+  createRootSpan,
+  finishSpan,
   setSpanAttributes,
-  type TracingContext 
+  type TracingContext,
 } from './tracing';

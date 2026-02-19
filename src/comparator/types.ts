@@ -1,7 +1,7 @@
 export interface ResponseData {
   status: number;
   headers: Record<string, string>;
-  body: any;
+  body: unknown;
   duration: number;
   error?: string;
 }
@@ -19,8 +19,8 @@ export interface ComparisonResult {
 export interface Difference {
   type: 'status' | 'header' | 'body' | 'latency';
   path?: string;
-  expected: any;
-  actual: any;
+  expected: unknown;
+  actual: unknown;
   severity: 'critical' | 'major' | 'minor';
 }
 

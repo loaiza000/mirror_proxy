@@ -5,6 +5,7 @@ import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentation
 import { PrometheusExporter } from '@opentelemetry/exporter-prometheus';
 
 import { config } from './config';
+import { paginationSchema } from './config/schemas';
 import { logger, metrics, register } from './observability';
 import { database } from './persistence';
 import { RulesEngine } from './rules';
@@ -12,14 +13,19 @@ import { ShadowDispatcher } from './dispatcher';
 import { ResponseComparator } from './comparator';
 import { createProxyMiddleware, extractRequestContext, ProxyRequest } from './proxy';
 import { createControlPlaneRoutes } from './control-plane';
+import { toErrorMessage, validateQuery, rateLimiter } from './middleware';
+
+/** Graceful shutdown timeout in milliseconds. */
+const SHUTDOWN_TIMEOUT_MS = 15_000;
 
 class MirrorProxyApplication {
-  private app: express.Application;
+  private readonly app: express.Application;
   private server: http.Server | null = null;
-  private rulesEngine: RulesEngine;
-  private dispatcher: ShadowDispatcher;
-  private comparator: ResponseComparator;
-  private otelSDK: NodeSDK;
+  private readonly rulesEngine: RulesEngine;
+  private readonly dispatcher: ShadowDispatcher;
+  private readonly comparator: ResponseComparator;
+  private readonly otelSDK: NodeSDK;
+  private isShuttingDown = false;
 
   constructor() {
     this.app = express();
@@ -49,17 +55,23 @@ class MirrorProxyApplication {
   }
 
   private setupMiddleware(): void {
-    this.app.use(express.json({ limit: '10mb' }));
-    this.app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+    // Disable Express fingerprinting
+    this.app.disable('x-powered-by');
 
-    this.app.use((_req: ProxyRequest, res, next) => {
+    // Body parsers with size limits
+    this.app.use(express.json({ limit: '2mb' }));
+    this.app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+
+    // Custom identifier header
+    this.app.use((_req: express.Request, res: express.Response, next: express.NextFunction) => {
       res.setHeader('X-Powered-By', 'MirrorProxy');
       next();
     });
 
-    this.app.use((req: ProxyRequest, res, next) => {
+    // Metrics collection middleware
+    this.app.use((req: ProxyRequest, res: express.Response, next: express.NextFunction) => {
       const startTime = Date.now();
-      
+
       res.on('finish', () => {
         const duration = Date.now() - startTime;
         metrics.requestsTotal.inc({
@@ -67,7 +79,7 @@ class MirrorProxyApplication {
           status: res.statusCode.toString(),
           target: 'proxy',
         });
-        
+
         metrics.requestDuration.observe(
           {
             method: req.method,
@@ -83,57 +95,74 @@ class MirrorProxyApplication {
   }
 
   private setupRoutes(): void {
+    // ─── Health ────────────────────────────────────────────────────
     this.app.get('/health', (_req, res) => {
       res.json({
-        status: 'healthy',
+        status: this.isShuttingDown ? 'shutting_down' : 'healthy',
         timestamp: new Date().toISOString(),
         version: '1.0.0',
         uptime: process.uptime(),
       });
     });
 
+    // ─── Prometheus Metrics ───────────────────────────────────────
     this.app.get('/metrics', async (_req, res) => {
       try {
         const metricsData = await register.metrics();
         res.set('Content-Type', register.contentType);
         res.end(metricsData);
       } catch (error) {
-        logger.error({ error: error instanceof Error ? error.message : 'Unknown error' }, 'Failed to generate metrics');
+        logger.error({ error: toErrorMessage(error) }, 'Failed to generate metrics');
         res.status(500).json({ error: 'Failed to generate metrics' });
       }
     });
 
-    this.app.use('/api/control', createControlPlaneRoutes(
-      this.rulesEngine,
-      this.dispatcher,
-      this.comparator
-    ));
+    // ─── Control Plane API ────────────────────────────────────────
+    this.app.use(
+      '/api/control',
+      createControlPlaneRoutes(this.rulesEngine, this.dispatcher, this.comparator)
+    );
 
-    this.app.use('/api/comparisons', async (req, res) => {
-      try {
-        const limit = parseInt(req.query['limit'] as string) || 100;
-        const offset = parseInt(req.query['offset'] as string) || 0;
-        const target = req.query['target'] as string;
+    // ─── Comparison Results ───────────────────────────────────────
+    const comparisonsLimiter = rateLimiter(60_000, 120);
 
-        const results = await database.getComparisonResults(limit, offset, target);
-        const stats = await database.getComparisonStats(target);
+    this.app.get(
+      '/api/comparisons',
+      comparisonsLimiter,
+      validateQuery(paginationSchema),
+      async (req: express.Request, res: express.Response) => {
+        try {
+          const limit = Number(req.query['limit']) || 100;
+          const offset = Number(req.query['offset']) || 0;
+          const target = req.query['target'] as string | undefined;
 
-        res.json({
-          results,
-          stats,
-          pagination: {
-            limit,
-            offset,
-            total: results.length,
-          },
-        });
-      } catch (error) {
-        logger.error({ error: error instanceof Error ? error.message : 'Unknown error' }, 'Failed to get comparison results');
-        res.status(500).json({ error: 'Failed to retrieve comparison results' });
+          const [results, total, stats] = await Promise.all([
+            database.getComparisonResults(limit, offset, target),
+            database.getComparisonCount(target),
+            database.getComparisonStats(target),
+          ]);
+
+          res.json({
+            results,
+            stats,
+            pagination: {
+              limit,
+              offset,
+              total,
+            },
+          });
+        } catch (error) {
+          logger.error(
+            { error: toErrorMessage(error) },
+            'Failed to get comparison results'
+          );
+          res.status(500).json({ error: 'Failed to retrieve comparison results' });
+        }
       }
-    });
+    );
 
-    this.app.use((req: ProxyRequest, _res, next) => {
+    // ─── Shadow Dispatch ──────────────────────────────────────────
+    this.app.use((req: ProxyRequest, _res: express.Response, next: express.NextFunction) => {
       const context = extractRequestContext(req);
       const evaluation = this.rulesEngine.evaluateRequest(context);
 
@@ -146,62 +175,88 @@ class MirrorProxyApplication {
           body: req.body,
         };
 
-        setImmediate(async () => {
-          try {
-            const dispatchResults = await this.dispatcher.dispatchToTargets(
-              shadowRequest,
-              evaluation.applicableTargets
-            );
+        const requestId = req.mirrotap?.requestId ?? 'unknown';
 
-            for (const result of dispatchResults) {
-              const primaryResponse = {
-                status: 0,
-                headers: {},
-                body: null,
-                duration: 0,
-              };
-
-              const comparison = this.comparator.compare(
-                req.mirrotap?.requestId || 'unknown',
-                result.target,
-                primaryResponse,
-                result.response
-              );
-
-              await database.saveComparisonResult(comparison);
-            }
-          } catch (error) {
-            logger.error({ 
-              requestId: req.mirrotap?.requestId,
-              error: error instanceof Error ? error.message : 'Unknown error' 
-            }, 'Failed to process shadow comparison');
-          }
-        });
+        // Fire-and-forget shadow processing — errors must not escape
+        this.processShadowRequests(requestId, shadowRequest, evaluation.applicableTargets);
       }
 
       next();
     });
 
+    // ─── Primary Proxy ────────────────────────────────────────────
     this.app.use('/', createProxyMiddleware());
   }
 
+  /**
+   * Dispatches shadow requests and saves comparisons.
+   * Fully contained — errors are logged but never rethrown.
+   */
+  private processShadowRequests(
+    requestId: string,
+    shadowRequest: { method: string; path: string; headers: Record<string, string>; query: Record<string, string>; body: unknown },
+    targets: string[]
+  ): void {
+    setImmediate(() => {
+      this.dispatcher
+        .dispatchToTargets(shadowRequest, targets)
+        .then(async (dispatchResults) => {
+          const savePromises = dispatchResults.map((result) => {
+            const primaryResponse = {
+              status: 0,
+              headers: {},
+              body: null,
+              duration: 0,
+            };
+
+            const comparison = this.comparator.compare(
+              requestId,
+              result.target,
+              primaryResponse,
+              result.response
+            );
+
+            return database.saveComparisonResult(comparison);
+          });
+
+          await Promise.allSettled(savePromises);
+        })
+        .catch((error: unknown) => {
+          logger.error(
+            {
+              requestId,
+              error: toErrorMessage(error),
+            },
+            'Failed to process shadow comparison'
+          );
+        });
+    });
+  }
+
   private setupErrorHandling(): void {
+    // 404 handler
     this.app.use((_req: express.Request, res: express.Response) => {
       res.status(404).json({ error: 'Not found' });
     });
 
-    this.app.use((err: Error, req: express.Request, res: express.Response, _next: express.NextFunction) => {
-      logger.error({
-        error: err.message,
-        stack: err.stack,
-        method: req.method,
-        path: req.path,
-      }, 'Unhandled error');
+    // Global error handler
+    this.app.use(
+      (err: Error, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+        logger.error(
+          {
+            error: err.message,
+            stack: err.stack,
+            method: req.method,
+            path: req.path,
+          },
+          'Unhandled error'
+        );
 
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Internal server error' });
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Internal server error' });
+        }
       }
-    });
+    );
   }
 
   async start(): Promise<void> {
@@ -220,50 +275,91 @@ class MirrorProxyApplication {
       }
 
       this.server = this.app.listen(config.port, () => {
-        logger.info({
-          port: config.port,
-          primaryUpstream: config.primaryUpstream,
-          shadowTimeout: config.shadowTimeout,
-          tracingEnabled: config.observability.tracingEnabled,
-          metricsPort: config.observability.metricsPort,
-        }, 'MirrorProxy started successfully');
+        logger.info(
+          {
+            port: config.port,
+            primaryUpstream: config.primaryUpstream,
+            shadowTimeout: config.shadowTimeout,
+            tracingEnabled: config.observability.tracingEnabled,
+            metricsPort: config.observability.metricsPort,
+          },
+          'MirrorProxy started successfully'
+        );
       });
 
       this.setupGracefulShutdown();
-
     } catch (error) {
-      logger.error({ error: error instanceof Error ? error.message : 'Unknown error' }, 'Failed to start application');
+      logger.error(
+        { error: toErrorMessage(error) },
+        'Failed to start application'
+      );
       process.exit(1);
     }
   }
 
   private setupGracefulShutdown(): void {
-    const shutdown = async (signal: string) => {
-      logger.info({ signal }, 'Received shutdown signal');
+    const shutdown = async (signal: string): Promise<void> => {
+      if (this.isShuttingDown) {
+        logger.warn({ signal }, 'Duplicate shutdown signal received, ignoring');
+        return;
+      }
 
-      this.server?.close(async () => {
-        logger.info('HTTP server closed');
+      this.isShuttingDown = true;
+      logger.info({ signal }, 'Received shutdown signal, starting graceful shutdown');
 
-        try {
-          if (config.observability.tracingEnabled) {
-            await this.otelSDK.shutdown();
-            logger.info('OpenTelemetry shut down');
-          }
+      // Force-exit after timeout to prevent hanging
+      const forceExitTimer = setTimeout(() => {
+        logger.error('Graceful shutdown timed out, forcing exit');
+        process.exit(1);
+      }, SHUTDOWN_TIMEOUT_MS);
+      forceExitTimer.unref();
 
-          await database.close();
-          logger.info('Database connections closed');
-
-          logger.info('Application shutdown complete');
-          process.exit(0);
-        } catch (error) {
-          logger.error({ error: error instanceof Error ? error.message : 'Unknown error' }, 'Error during shutdown');
-          process.exit(1);
+      try {
+        // Stop accepting new connections
+        if (this.server) {
+          await new Promise<void>((resolve, reject) => {
+            this.server?.close((err) => {
+              if (err) reject(err);
+              else resolve();
+            });
+          });
+          logger.info('HTTP server closed');
         }
-      });
+
+        // Shutdown OpenTelemetry
+        if (config.observability.tracingEnabled) {
+          await this.otelSDK.shutdown();
+          logger.info('OpenTelemetry shut down');
+        }
+
+        // Close database connection
+        await database.close();
+        logger.info('Database connections closed');
+
+        logger.info('Application shutdown complete');
+        process.exit(0);
+      } catch (error) {
+        logger.error({ error: toErrorMessage(error) }, 'Error during shutdown');
+        process.exit(1);
+      }
     };
 
-    process.on('SIGTERM', () => shutdown('SIGTERM'));
-    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => void shutdown('SIGTERM'));
+    process.on('SIGINT', () => void shutdown('SIGINT'));
+
+    // Catch uncaught exceptions and unhandled rejections at the process level
+    process.on('uncaughtException', (error) => {
+      logger.fatal({ error: error.message, stack: error.stack }, 'Uncaught exception');
+      void shutdown('uncaughtException');
+    });
+
+    process.on('unhandledRejection', (reason) => {
+      logger.fatal(
+        { error: reason instanceof Error ? reason.message : String(reason) },
+        'Unhandled promise rejection'
+      );
+      void shutdown('unhandledRejection');
+    });
   }
 }
 
@@ -273,7 +369,8 @@ async function main(): Promise<void> {
 }
 
 if (require.main === module) {
-  main().catch((error) => {
+  main().catch((error: unknown) => {
+    // eslint-disable-next-line no-console
     console.error('Failed to start application:', error);
     process.exit(1);
   });

@@ -1,15 +1,24 @@
 import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../observability';
-import { 
-  ShadowingRule, 
-  RequestContext, 
-  RuleEvaluationResult, 
-  RuleCondition 
+import {
+  ShadowingRule,
+  RequestContext,
+  RuleEvaluationResult,
+  RuleCondition,
 } from './types';
+
+/** Maximum allowed length for a user-supplied regex pattern. */
+const MAX_REGEX_LENGTH = 256;
+
+/** Timeout (ms) for regex evaluation to prevent ReDoS. */
+const REGEX_EVAL_TIMEOUT_MS = 50;
 
 export class RulesEngine {
   private rules: Map<string, ShadowingRule> = new Map();
-  private killSwitch: boolean = false;
+  private killSwitch = false;
+
+  // Compiled regex cache to avoid re-compilation on every request
+  private regexCache: Map<string, RegExp> = new Map();
 
   addRule(rule: Omit<ShadowingRule, 'id'>): string {
     const id = uuidv4();
@@ -35,6 +44,10 @@ export class RulesEngine {
 
     const updated: ShadowingRule = { ...existing, ...updates };
     this.rules.set(id, updated);
+
+    // Invalidate regex cache when rules are updated
+    this.regexCache.clear();
+
     logger.info({ ruleId: id }, 'Rule updated');
     return true;
   }
@@ -65,8 +78,9 @@ export class RulesEngine {
       };
     }
 
-    const applicableRules = Array.from(this.rules.values())
-      .filter(rule => rule.enabled && this.evaluateConditions(rule.conditions, context));
+    const applicableRules = Array.from(this.rules.values()).filter(
+      (rule) => rule.enabled && this.evaluateConditions(rule.conditions, context)
+    );
 
     if (applicableRules.length === 0) {
       return {
@@ -76,11 +90,11 @@ export class RulesEngine {
       };
     }
 
-    const allTargets = applicableRules.flatMap(rule => rule.targets);
+    const allTargets = applicableRules.flatMap((rule) => rule.targets);
     const uniqueTargets = [...new Set(allTargets)];
 
-    const shouldSample = applicableRules.some(rule => 
-      !rule.sampling.enabled || this.shouldSample(rule.sampling.percentage)
+    const shouldSample = applicableRules.some(
+      (rule) => !rule.sampling.enabled || this.shouldSample(rule.sampling.percentage)
     );
 
     return {
@@ -90,8 +104,11 @@ export class RulesEngine {
     };
   }
 
-  private evaluateConditions(conditions: RuleCondition[], context: RequestContext): boolean {
-    return conditions.every(condition => this.evaluateCondition(condition, context));
+  private evaluateConditions(
+    conditions: RuleCondition[],
+    context: RequestContext
+  ): boolean {
+    return conditions.every((condition) => this.evaluateCondition(condition, context));
   }
 
   private evaluateCondition(condition: RuleCondition, context: RequestContext): boolean {
@@ -105,10 +122,12 @@ export class RulesEngine {
         actualValue = context.method;
         break;
       case 'header':
-        actualValue = condition.key ? context.headers[condition.key.toLowerCase()] || '' : '';
+        actualValue = condition.key
+          ? context.headers[condition.key.toLowerCase()] ?? ''
+          : '';
         break;
       case 'query':
-        actualValue = condition.key ? context.query[condition.key] || '' : '';
+        actualValue = condition.key ? context.query[condition.key] ?? '' : '';
         break;
       default:
         return false;
@@ -128,22 +147,55 @@ export class RulesEngine {
       case 'ends_with':
         return actual.endsWith(expected);
       case 'regex':
-        try {
-          const regex = new RegExp(expected);
-          return regex.test(actual);
-        } catch {
-          return false;
-        }
+        return this.safeRegexTest(expected, actual);
       default:
         return false;
+    }
+  }
+
+  /**
+   * Safely evaluates a regex pattern against a value.
+   * Guards against ReDoS by limiting pattern length and catching errors.
+   */
+  private safeRegexTest(pattern: string, value: string): boolean {
+    if (pattern.length > MAX_REGEX_LENGTH) {
+      logger.warn(
+        { patternLength: pattern.length, maxLength: MAX_REGEX_LENGTH },
+        'Regex pattern exceeds maximum length, skipping evaluation'
+      );
+      return false;
+    }
+
+    try {
+      let regex = this.regexCache.get(pattern);
+      if (!regex) {
+        regex = new RegExp(pattern);
+        this.regexCache.set(pattern, regex);
+      }
+
+      // Use Date.now() for basic timeout detection
+      const start = Date.now();
+      const result = regex.test(value);
+      const elapsed = Date.now() - start;
+
+      if (elapsed > REGEX_EVAL_TIMEOUT_MS) {
+        logger.warn(
+          { pattern, elapsed, threshold: REGEX_EVAL_TIMEOUT_MS },
+          'Regex evaluation took too long, consider simplifying the pattern'
+        );
+      }
+
+      return result;
+    } catch {
+      logger.warn({ pattern }, 'Invalid regex pattern');
+      return false;
     }
   }
 
   private shouldSample(percentage: number): boolean {
     if (percentage <= 0) return false;
     if (percentage >= 100) return true;
-    
-    const random = Math.random() * 100;
-    return random <= percentage;
+
+    return Math.random() * 100 < percentage;
   }
 }

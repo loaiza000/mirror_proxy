@@ -1,15 +1,15 @@
 import { isEqual, cloneDeep, omit } from 'lodash';
 import { logger, metrics } from '../observability';
-import { 
-  ResponseData, 
-  ComparisonResult, 
-  Difference, 
-  ComparisonSummary, 
-  ComparisonConfig 
+import {
+  ResponseData,
+  ComparisonResult,
+  Difference,
+  ComparisonSummary,
+  ComparisonConfig,
 } from './types';
 
 export class ResponseComparator {
-  private config: ComparisonConfig;
+  private readonly config: ComparisonConfig;
 
   constructor(config: Partial<ComparisonConfig> = {}) {
     this.config = {
@@ -151,8 +151,10 @@ export class ResponseComparator {
       const diff = shadow.duration - primary.duration;
       const diffPercent = (Math.abs(diff) / primary.duration) * 100;
 
-      if (Math.abs(diff) > this.config.latencyThresholdMs || 
-          diffPercent > this.config.latencyThresholdPercent) {
+      if (
+        Math.abs(diff) > this.config.latencyThresholdMs ||
+        diffPercent > this.config.latencyThresholdPercent
+      ) {
         differences.push({
           type: 'latency',
           expected: primary.duration,
@@ -167,29 +169,33 @@ export class ResponseComparator {
 
   private filterHeaders(headers: Record<string, string>): Record<string, string> {
     const filtered: Record<string, string> = {};
-    
-    Object.entries(headers).forEach(([name, value]) => {
+
+    for (const [name, value] of Object.entries(headers)) {
       const normalizedName = name.toLowerCase();
       if (!this.config.ignoreHeaders.includes(normalizedName)) {
         filtered[normalizedName] = value;
       }
-    });
+    }
 
     return filtered;
   }
 
-  private normalizeBody(body: any): any {
+  private normalizeBody(body: unknown): unknown {
     if (!body) return body;
 
     if (typeof body === 'object' && !Array.isArray(body)) {
-      const cloned = cloneDeep(body);
+      const cloned = cloneDeep(body) as Record<string, unknown>;
       return omit(cloned, this.config.ignoreBodyFields);
     }
 
     return body;
   }
 
-  private findBodyDifferences(primary: any, shadow: any, path: string = ''): Difference[] {
+  private findBodyDifferences(
+    primary: unknown,
+    shadow: unknown,
+    path: string = ''
+  ): Difference[] {
     const differences: Difference[] = [];
 
     if (typeof primary !== typeof shadow) {
@@ -216,16 +222,21 @@ export class ResponseComparator {
       return differences;
     }
 
-    const allKeys = new Set([...Object.keys(primary), ...Object.keys(shadow)]);
+    const primaryObj = primary as Record<string, unknown>;
+    const shadowObj = (shadow ?? {}) as Record<string, unknown>;
+
+    const allKeys = new Set([...Object.keys(primaryObj), ...Object.keys(shadowObj)]);
 
     for (const key of allKeys) {
       const currentPath = path ? `${path}.${key}` : key;
-      const primaryValue = primary[key];
-      const shadowValue = shadow[key];
+      const primaryValue = primaryObj[key];
+      const shadowValue = shadowObj[key];
 
       if (!isEqual(primaryValue, shadowValue)) {
         if (typeof primaryValue === 'object' && primaryValue !== null) {
-          differences.push(...this.findBodyDifferences(primaryValue, shadowValue, currentPath));
+          differences.push(
+            ...this.findBodyDifferences(primaryValue, shadowValue, currentPath)
+          );
         } else {
           differences.push({
             type: 'body',
@@ -242,18 +253,17 @@ export class ResponseComparator {
   }
 
   private generateSummary(
-    differences: Difference[], 
-    primary: ResponseData, 
+    differences: Difference[],
+    primary: ResponseData,
     shadow: ResponseData
   ): ComparisonSummary {
-    const criticalDifferences = differences.filter(d => d.severity === 'critical').length;
-    const majorDifferences = differences.filter(d => d.severity === 'major').length;
-    const minorDifferences = differences.filter(d => d.severity === 'minor').length;
+    const criticalDifferences = differences.filter((d) => d.severity === 'critical').length;
+    const majorDifferences = differences.filter((d) => d.severity === 'major').length;
+    const minorDifferences = differences.filter((d) => d.severity === 'minor').length;
 
     const latencyDifference = shadow.duration - primary.duration;
-    const latencyDifferencePercent = primary.duration > 0 
-      ? (Math.abs(latencyDifference) / primary.duration) * 100 
-      : 0;
+    const latencyDifferencePercent =
+      primary.duration > 0 ? (Math.abs(latencyDifference) / primary.duration) * 100 : 0;
 
     return {
       identical: differences.length === 0,
@@ -266,7 +276,10 @@ export class ResponseComparator {
     };
   }
 
-  private getStatusSeverity(primaryStatus: number, shadowStatus: number): 'critical' | 'major' | 'minor' {
+  private getStatusSeverity(
+    primaryStatus: number,
+    shadowStatus: number
+  ): 'critical' | 'major' | 'minor' {
     if (primaryStatus < 400 && shadowStatus >= 400) return 'critical';
     if (primaryStatus >= 400 && shadowStatus < 400) return 'critical';
     if (Math.abs(primaryStatus - shadowStatus) >= 100) return 'major';

@@ -1,4 +1,4 @@
-import axios, { AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios';
+import axios, { AxiosInstance, AxiosResponse } from 'axios';
 import { logger, metrics, finishSpan, setSpanAttributes } from '../observability';
 import { trace, SpanKind } from '@opentelemetry/api';
 import { config } from '../config';
@@ -10,20 +10,33 @@ export interface ShadowRequest {
   path: string;
   headers: Record<string, string>;
   query: Record<string, string>;
-  body?: any;
+  body?: unknown;
 }
 
 export interface ShadowResponse {
   status: number;
   headers: Record<string, string>;
-  body: any;
+  body: unknown;
   duration: number;
   error?: string;
 }
 
+/** Headers that must not be forwarded to shadow targets. */
+const HOP_BY_HOP_HEADERS = new Set([
+  'host',
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailers',
+  'transfer-encoding',
+  'upgrade',
+]);
+
 export class ShadowClient {
-  private client: AxiosInstance;
-  private target: string;
+  private readonly client: AxiosInstance;
+  private readonly target: string;
 
   constructor(target: string) {
     this.target = target;
@@ -31,6 +44,10 @@ export class ShadowClient {
       baseURL: target,
       timeout: config.shadowTimeout,
       validateStatus: () => true,
+      // Disable automatic decompression to avoid double-decompressing
+      decompress: true,
+      maxContentLength: 10 * 1024 * 1024, // 10 MB
+      maxBodyLength: 10 * 1024 * 1024,
     });
   }
 
@@ -42,10 +59,14 @@ export class ShadowClient {
     });
 
     try {
-      const axiosConfig: AxiosRequestConfig = {
-        method: request.method.toLowerCase() as any,
+      const filteredHeaders = this.filterHeaders(request.headers);
+      const method = request.method.toLowerCase();
+
+      // Build config inline to avoid exactOptionalPropertyTypes issues with AxiosRequestConfig
+      const axiosConfig = {
+        method,
         url: request.path,
-        headers: this.filterHeaders(request.headers),
+        headers: filteredHeaders,
         params: request.query,
         data: request.body,
       };
@@ -61,8 +82,8 @@ export class ShadowClient {
 
       const shadowResponse: ShadowResponse = {
         status: response.status,
-        headers: this.normalizeHeaders(response.headers),
-        body: response.data,
+        headers: this.normalizeHeaders(response.headers as Record<string, string | string[] | undefined>),
+        body: response.data as unknown,
         duration,
       };
 
@@ -71,10 +92,7 @@ export class ShadowClient {
         status: response.status.toString(),
       });
 
-      metrics.shadowRequestDuration.observe(
-        { target: this.target },
-        duration / 1000
-      );
+      metrics.shadowRequestDuration.observe({ target: this.target }, duration / 1000);
 
       logger.debug(
         {
@@ -87,7 +105,6 @@ export class ShadowClient {
 
       finishSpan(span);
       return shadowResponse;
-
     } catch (error) {
       const duration = Date.now() - startTime;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -121,34 +138,28 @@ export class ShadowClient {
 
   private filterHeaders(headers: Record<string, string>): Record<string, string> {
     const filtered: Record<string, string> = {};
-    const ignoredHeaders = [
-      'host',
-      'connection',
-      'keep-alive',
-      'proxy-authenticate',
-      'proxy-authorization',
-      'te',
-      'trailers',
-      'transfer-encoding',
-      'upgrade',
-    ];
 
-    Object.entries(headers).forEach(([key, value]) => {
-      if (!ignoredHeaders.includes(key.toLowerCase()) && !key.startsWith('x-mirrotap')) {
+    for (const [key, value] of Object.entries(headers)) {
+      const lower = key.toLowerCase();
+      if (!HOP_BY_HOP_HEADERS.has(lower) && !lower.startsWith('x-mirrotap')) {
         filtered[key] = value;
       }
-    });
+    }
 
     return filtered;
   }
 
-  private normalizeHeaders(headers: any): Record<string, string> {
+  private normalizeHeaders(
+    headers: Record<string, string | string[] | undefined>
+  ): Record<string, string> {
     const normalized: Record<string, string> = {};
-    
+
     if (typeof headers === 'object' && headers !== null) {
-      Object.entries(headers).forEach(([key, value]) => {
-        normalized[key.toLowerCase()] = Array.isArray(value) ? value.join(', ') : String(value);
-      });
+      for (const [key, value] of Object.entries(headers)) {
+        if (value !== undefined) {
+          normalized[key.toLowerCase()] = Array.isArray(value) ? value.join(', ') : String(value);
+        }
+      }
     }
 
     return normalized;

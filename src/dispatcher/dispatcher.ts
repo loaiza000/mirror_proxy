@@ -1,5 +1,6 @@
 import { logger } from '../observability';
 import { ShadowClient, ShadowRequest, ShadowResponse } from './client';
+import { toErrorMessage } from '../middleware';
 
 export interface DispatchResult {
   target: string;
@@ -7,7 +8,7 @@ export interface DispatchResult {
 }
 
 export class ShadowDispatcher {
-  private clients: Map<string, ShadowClient> = new Map();
+  private readonly clients: Map<string, ShadowClient> = new Map();
 
   addTarget(target: string): void {
     if (!this.clients.has(target)) {
@@ -26,7 +27,10 @@ export class ShadowDispatcher {
     return Array.from(this.clients.keys());
   }
 
-  async dispatchToTargets(request: ShadowRequest, targets: string[]): Promise<DispatchResult[]> {
+  async dispatchToTargets(
+    request: ShadowRequest,
+    targets: string[]
+  ): Promise<DispatchResult[]> {
     const promises: Promise<DispatchResult>[] = [];
 
     for (const target of targets) {
@@ -42,36 +46,41 @@ export class ShadowDispatcher {
       return [];
     }
 
-    try {
-      const results = await Promise.allSettled(promises);
-      
-      return results
-        .filter((result): result is PromiseFulfilledResult<DispatchResult> => 
-          result.status === 'fulfilled'
-        )
-        .map(result => result.value);
+    const results = await Promise.allSettled(promises);
 
-    } catch (error) {
-      logger.error({ error: error instanceof Error ? error.message : 'Unknown error' }, 'Error in batch dispatch');
-      return [];
+    const fulfilled: DispatchResult[] = [];
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        fulfilled.push(result.value);
+      } else {
+        logger.error(
+          { error: toErrorMessage(result.reason) },
+          'Unexpected error in shadow dispatch settlement'
+        );
+      }
     }
+
+    return fulfilled;
   }
 
-  private async dispatchToTarget(client: ShadowClient, request: ShadowRequest): Promise<DispatchResult> {
+  private async dispatchToTarget(
+    client: ShadowClient,
+    request: ShadowRequest
+  ): Promise<DispatchResult> {
     const target = client.getTarget();
-    
+
     try {
       const response = await client.sendRequest(request);
       return { target, response };
     } catch (error) {
       logger.error(
-        { 
-          target, 
-          error: error instanceof Error ? error.message : 'Unknown error' 
+        {
+          target,
+          error: toErrorMessage(error),
         },
         'Failed to dispatch to shadow target'
       );
-      
+
       return {
         target,
         response: {
@@ -79,33 +88,10 @@ export class ShadowDispatcher {
           headers: {},
           body: null,
           duration: 0,
-          error: error instanceof Error ? error.message : 'Unknown error',
+          error: toErrorMessage(error),
         },
       };
     }
-  }
-
-  async dispatchToTargetAsync(request: ShadowRequest, target: string): Promise<void> {
-    const client = this.clients.get(target);
-    if (!client) {
-      logger.warn({ target }, 'Shadow client not found for async dispatch');
-      return;
-    }
-
-    setImmediate(async () => {
-      try {
-        await client.sendRequest(request);
-        logger.debug({ target }, 'Async shadow dispatch completed');
-      } catch (error) {
-        logger.error(
-          { 
-            target, 
-            error: error instanceof Error ? error.message : 'Unknown error' 
-          },
-          'Async shadow dispatch failed'
-        );
-      }
-    });
   }
 
   clearTargets(): void {

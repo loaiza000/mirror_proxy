@@ -19,23 +19,23 @@ export function createProxyMiddleware() {
     changeOrigin: true,
     followRedirects: true,
     timeout: 30000,
-    onProxyReq: (_proxyReq, req, _res) => {
+    onProxyReq: (_proxyReq, req) => {
       const proxyReqExtended = req as ProxyRequest;
       logger.debug(
         { requestId: proxyReqExtended.mirrotap?.requestId },
         'Forwarding request to upstream'
       );
     },
-    onProxyRes: (proxyRes, req, _res) => {
+    onProxyRes: (proxyRes, req) => {
       const proxyReqExtended = req as ProxyRequest;
-      const duration = Date.now() - (proxyReqExtended.mirrotap?.startTime || 0);
-      
+      const duration = Date.now() - (proxyReqExtended.mirrotap?.startTime ?? 0);
+
       metrics.requestsTotal.inc({
         method: req.method,
-        status: (proxyRes.statusCode || 0).toString(),
+        status: (proxyRes.statusCode ?? 0).toString(),
         target: 'primary',
       });
-      
+
       metrics.requestDuration.observe(
         {
           method: req.method,
@@ -57,27 +57,28 @@ export function createProxyMiddleware() {
     onError: (err, req, res) => {
       const proxyReqExtended = req as ProxyRequest;
       logger.error(
-        { 
+        {
           requestId: proxyReqExtended.mirrotap?.requestId,
           error: err.message,
         },
         'Proxy error'
       );
-      
+
       metrics.requestsTotal.inc({
         method: req.method,
-        status: '500',
+        status: '502',
         target: 'primary',
       });
 
-      if (!res.headersSent) {
-        res.status(502).json({ error: 'Bad Gateway' });
+      // The res type from http-proxy-middleware can be either ServerResponse or Socket
+      if ('headersSent' in res && !res.headersSent && 'status' in res) {
+        (res as unknown as Response).status(502).json({ error: 'Bad Gateway' });
       }
     },
   });
 
   return (req: ProxyRequest, res: Response, next: NextFunction) => {
-    const requestId = generateRequestId();
+    const requestId = uuidv4();
     const startTime = Date.now();
 
     req.mirrotap = {
@@ -93,7 +94,7 @@ export function createProxyMiddleware() {
 
     setSpanAttributes(span, {
       'http.target': config.primaryUpstream,
-      'user.agent': req.headers['user-agent'] || '',
+      'user.agent': req.headers['user-agent'] ?? '',
     });
 
     res.on('finish', () => {
@@ -106,19 +107,19 @@ export function createProxyMiddleware() {
 
 export function extractRequestContext(req: ProxyRequest): RequestContext {
   const headers: Record<string, string> = {};
-  
-  Object.entries(req.headers).forEach(([key, value]) => {
+
+  for (const [key, value] of Object.entries(req.headers)) {
     if (typeof value === 'string') {
       headers[key.toLowerCase()] = value;
     } else if (Array.isArray(value)) {
       headers[key.toLowerCase()] = value.join(', ');
     }
-  });
+  }
 
   const query: Record<string, string> = {};
-  Object.entries(req.query).forEach(([key, value]) => {
-    query[key] = Array.isArray(value) ? value.join(',') : String(value || '');
-  });
+  for (const [key, value] of Object.entries(req.query)) {
+    query[key] = Array.isArray(value) ? value.join(',') : String(value ?? '');
+  }
 
   return {
     method: req.method,
@@ -127,8 +128,4 @@ export function extractRequestContext(req: ProxyRequest): RequestContext {
     query,
     body: req.body,
   };
-}
-
-function generateRequestId(): string {
-  return uuidv4();
 }

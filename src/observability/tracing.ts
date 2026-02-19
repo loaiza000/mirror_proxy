@@ -9,21 +9,12 @@ export interface TracingContext {
 }
 
 export function createRootSpan(context: TracingContext): Span {
-  return tracer.startSpan(`http.request`, {
+  return tracer.startSpan('http.request', {
     kind: SpanKind.SERVER,
     attributes: {
       'http.method': context.method,
       'http.url': context.path,
       'request.id': context.requestId,
-    },
-  });
-}
-
-export function createShadowSpan(_parentSpan: Span, target: string): Span {
-  return tracer.startSpan(`shadow.request`, {
-    kind: SpanKind.CLIENT,
-    attributes: {
-      'shadow.target': target,
     },
   });
 }
@@ -43,8 +34,11 @@ export function finishSpan(span: Span, error?: Error): void {
   span.end();
 }
 
-export function setSpanAttributes(span: Span, attributes: Record<string, string | number | boolean>): void {
-  Object.entries(attributes).forEach(([key, value]) => {
+export function setSpanAttributes(
+  span: Span,
+  attributes: Record<string, string | number | boolean>
+): void {
+  for (const [key, value] of Object.entries(attributes)) {
     span.setAttribute(key, value);
-  });
+  }
 }

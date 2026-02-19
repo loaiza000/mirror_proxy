@@ -1,1 +1,1 @@
-export { MongoDatabase, database } from './mongoose';
+export { MongoDatabase, database, type ComparisonStats } from './mongoose';

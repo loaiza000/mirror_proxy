@@ -1,0 +1,40 @@
+version: "3.9"
+
+services:
+  mirror-proxy:
+    build: .
+    ports:
+      - "4040:4040"
+      - "9090:9090"
+    environment:
+      PORT: 4040
+      PRIMARY_UPSTREAM: http://host.docker.internal:8080
+      SHADOW_TIMEOUT: 5000
+      KILL_SWITCH: "false"
+      DB_HOST: mongo
+      DB_PORT: 27017
+      DB_NAME: mirror_proxy
+      LOG_LEVEL: info
+      METRICS_PORT: 9090
+      TRACING_ENABLED: "true"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  mongo-data:
